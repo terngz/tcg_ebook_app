@@ -1,0 +1,1217 @@
+import 'dart:io';
+import 'dart:convert';
+import 'dart:async'; // จำเป็นต้องใช้สำหรับ Timer
+import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:path/path.dart' as p;
+import 'package:http/http.dart' as http;
+import 'package:archive/archive.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart'; // <<< เพิ่มสำหรับ macOS
+
+// --- Constants & Configuration ---
+class AppColors {
+  static const Color primaryColor = Color(0xFF1e376d);
+  static const Color secondaryColor = Color(0xFF02b2e3);
+  static const Color accentColor = Color(0xFF04a52d);
+  static const Color notiColor = Color(0xFFff3b30);
+  static const Color surfaceColor = Color(0xFFF8F9FA);
+}
+
+// --- Network Configuration (Anti-Bot) ---
+const Map<String, String> kBrowserHeaders = {
+  'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept':
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  'Accept-Language': 'en-US,en;q=0.9,th;q=0.8',
+  'Accept-Encoding': 'gzip, deflate',
+  'Connection': 'keep-alive',
+  'Referer': 'http://www.konnextgroup.com/',
+};
+
+void main() {
+  _setupWindowsCache();
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(
+    MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(seedColor: AppColors.primaryColor),
+        textTheme: GoogleFonts.anuphanTextTheme(),
+      ),
+      home: const PortableApp(),
+    ),
+  );
+}
+
+void _setupWindowsCache() {
+  if (Platform.isWindows) {
+    debugPrint("Setting up WebView2 Cache Path...");
+  }
+}
+
+class PortableApp extends StatefulWidget {
+  const PortableApp({super.key});
+
+  @override
+  State<PortableApp> createState() => _PortableAppState();
+}
+
+class _PortableAppState extends State<PortableApp>
+    with TickerProviderStateMixin {
+  // --- Controllers ---
+  InAppWebViewController? webViewController;
+  late AnimationController _loadingController;
+  late AnimationController _menuController;
+  Timer? _menuAutoCloseTimer; // >>> เพิ่มตัวแปร Timer
+  Timer? _autoUpdateTimer; // >>> เพิ่มปิดออโต้อัพเดท
+
+  // --- State Variables ---
+  String localAppVersion = "";
+  String localContentVersion = "";
+  bool isPageLoading = true;
+  bool isUpdating = false;
+  bool fileExists = true;
+  bool isMenuOpen = false;
+
+  // --- Update State ---
+  bool isUpdateAvailable = false;
+  bool hasCheckedUpdate = false;
+  Map<String, dynamic>? cachedUpdateData;
+  bool _hasAppUp = false;
+  bool _hasContUp = false;
+
+  // --- Progress ---
+  double downloadProgress = 0.0;
+  int webProgress = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadingController = AnimationController(
+      duration: const Duration(seconds: 2),
+      vsync: this,
+    )..repeat();
+    _menuController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+    _initApp();
+  }
+
+  @override
+  void dispose() {
+    _menuAutoCloseTimer?.cancel(); // >>> อย่าลืม Cancel Timer เมื่อปิดแอป
+    _autoUpdateTimer?.cancel(); // >>> หยุดตัวเช็คอัพเดททันทีที่ปิดแอป
+    _loadingController.dispose();
+    _menuController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initApp() async {
+    await _loadLocalVersions();
+    await _checkFileExistence();
+    await _restoreUpdateState();
+  }
+
+  // --- ปรับปรุงจุดที่ 1: การจัดการ Path ให้เป็น Async เพื่อรองรับ macOS ---
+  Future<String> _getBasePath() async {
+    if (Platform.isWindows) {
+      return p.dirname(Platform.resolvedExecutable);
+    }
+    final dir = await getApplicationSupportDirectory();
+    return dir.path;
+  }
+
+  Future<File> _getUpdateCacheFile() async {
+    return File(p.join(await _getDataPath(), 'update_cache.json'));
+  }
+
+  String _getTempPath() => p.join(
+    Platform.environment['TEMP'] ?? Directory.systemTemp.path,
+    'app_reader_temp',
+  );
+
+  Future<String> _getHtmlPath() async =>
+      p.join(await _getBasePath(), 'contents');
+  Future<String> _getDataPath() async => p.join(await _getBasePath(), 'data');
+
+  Future<WebUri> _getWebUri() async {
+    final htmlDir = await _getHtmlPath();
+    final usb = p.join(htmlDir, 'index.html');
+    return File(usb).existsSync()
+        ? WebUri(Uri.file(usb).toString())
+        : WebUri(Uri.file(p.join(_getTempPath(), 'index.html')).toString());
+  }
+
+  Future<void> _restoreUpdateState() async {
+    try {
+      final file = await _getUpdateCacheFile();
+      if (await file.exists()) {
+        final data = jsonDecode(await file.readAsString());
+        bool appUp =
+            (data['app_version'] ?? localAppVersion) != localAppVersion;
+        bool contUp =
+            (data['content_version'] ?? localContentVersion) !=
+            localContentVersion;
+
+        if (appUp || contUp) {
+          if (mounted) {
+            setState(() {
+              isUpdateAvailable = true;
+              cachedUpdateData = data;
+              _hasAppUp = appUp;
+              _hasContUp = contUp;
+            });
+          }
+        } else {
+          await file.delete();
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadLocalVersions() async {
+    try {
+      final dataDir = await _getDataPath();
+      if (!await Directory(dataDir).exists()) {
+        await Directory(dataDir).create(recursive: true);
+      }
+
+      final appInfo = await PackageInfo.fromPlatform();
+      localAppVersion = appInfo.version;
+
+      final appFile = File(p.join(dataDir, 'version.txt'));
+      if (!await appFile.exists() ||
+          (await appFile.readAsString()).trim() != localAppVersion) {
+        await appFile.writeAsString(localAppVersion);
+      }
+
+      final contFile = File(p.join(dataDir, 'content_version.txt'));
+      if (await contFile.exists()) {
+        localContentVersion = (await contFile.readAsString()).trim();
+      } else {
+        localContentVersion = "1.0.0";
+        await contFile.writeAsString("1.0.0");
+      }
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
+  Future<void> _checkFileExistence() async {
+    final htmlDir = await _getHtmlPath();
+    if (mounted) {
+      setState(
+        () => fileExists = File(p.join(htmlDir, 'index.html')).existsSync(),
+      );
+    }
+  }
+
+  // --- Update Logic ---
+  Future<void> _checkUpdateAutomatically({bool isManual = false}) async {
+    try {
+      if (!isManual && isUpdateAvailable) return;
+      if (isManual && isUpdateAvailable && cachedUpdateData != null) {
+        _showModernDialog(
+          child: _buildUpdateDialogContent(
+            cachedUpdateData!,
+            _hasAppUp,
+            _hasContUp,
+          ),
+        );
+        return;
+      }
+      if (isManual) _showMessage("กำลังตรวจสอบการอัปเดต...");
+
+      final response = await http
+          .get(
+            Uri.parse(
+              'http://www.konnextgroup.com/testweb/appupdates/version.json',
+            ),
+            headers: kBrowserHeaders,
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        if ((response.headers['content-type'] ?? '').contains('text/html')) {
+          if (isManual && mounted) _showMessage("Server Busy (Bot Protection)");
+          return;
+        }
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
+        bool appUp =
+            (data['app_version'] ?? localAppVersion) != localAppVersion;
+        bool contUp =
+            (data['content_version'] ?? localContentVersion) !=
+            localContentVersion;
+
+        if (appUp || contUp) {
+          if (mounted) {
+            setState(() {
+              isUpdateAvailable = true;
+              cachedUpdateData = data;
+              _hasAppUp = appUp;
+              _hasContUp = contUp;
+            });
+            final cacheFile = await _getUpdateCacheFile();
+            cacheFile.writeAsString(jsonEncode(data));
+            if (isManual) {
+              _showModernDialog(
+                child: _buildUpdateDialogContent(data, appUp, contUp),
+              );
+            }
+          }
+        } else {
+          if (mounted) {
+            setState(() {
+              isUpdateAvailable = false;
+              cachedUpdateData = null;
+            });
+            final cacheFile = await _getUpdateCacheFile();
+            if (await cacheFile.exists()) {
+              await cacheFile.delete();
+            }
+            if (isManual) _showNoUpdateDialog();
+          }
+        }
+      } else if (isManual && mounted) {
+        _showMessage("เชื่อมต่อไม่ได้ (Code: ${response.statusCode})");
+      }
+      if (!isManual) hasCheckedUpdate = true;
+    } catch (_) {
+      if (isManual && mounted) _showMessage("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้");
+    }
+  }
+
+  Future<bool> _checkFileExists(String url) async {
+    try {
+      final r = await http
+          .head(Uri.parse(url), headers: kBrowserHeaders)
+          .timeout(const Duration(seconds: 5));
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _updateProcess(
+    String url,
+    String newVersion,
+    bool isAppUpdate,
+  ) async {
+    setState(() {
+      isUpdating = true;
+      downloadProgress = 0.0;
+    });
+    final tempDir = _getTempPath();
+    final zipPath = p.join(tempDir, p.basename(url));
+
+    try {
+      if (Directory(tempDir).existsSync()) {
+        Directory(tempDir).deleteSync(recursive: true);
+      }
+      Directory(tempDir).createSync(recursive: true);
+
+      final client = http.Client();
+      final request = http.Request('GET', Uri.parse(url))
+        ..headers.addAll(kBrowserHeaders);
+      final response = await client.send(request);
+
+      if (response.statusCode != 200) throw Exception("Download Failed");
+      final total = response.contentLength ?? 1;
+      int received = 0;
+      final sink = File(zipPath).openWrite();
+
+      await response.stream.forEach((chunk) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (mounted) {
+          setState(() => downloadProgress = (received / total) * 0.5);
+        }
+      });
+      await sink.flush();
+      await sink.close();
+      client.close();
+
+      final bytes = await File(zipPath).readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
+      int count = 0;
+      for (final file in archive) {
+        final fPath = p.join(tempDir, file.name);
+        if (file.isFile) {
+          File(fPath)
+            ..createSync(recursive: true)
+            ..writeAsBytesSync(file.content as List<int>);
+        } else {
+          Directory(fPath).createSync(recursive: true);
+        }
+        count++;
+        if (mounted) {
+          setState(
+            () => downloadProgress = 0.5 + ((count / archive.length) * 0.5),
+          );
+        }
+      }
+
+      final cacheFile = await _getUpdateCacheFile();
+      if (await cacheFile.exists()) await cacheFile.delete();
+
+      if (isAppUpdate && Platform.isWindows) {
+        final bat =
+            '''
+@echo off
+timeout /t 3 >nul
+taskkill /F /IM "${p.basename(Platform.resolvedExecutable)}" /T
+robocopy "$tempDir" "${p.dirname(Platform.resolvedExecutable)}" /E /R:3 /W:1 /XF *.zip
+start "" "${Platform.resolvedExecutable}"
+del "%~f0" & exit
+''';
+        await File(
+          p.join(p.dirname(Platform.resolvedExecutable), 'update.bat'),
+        ).writeAsString(bat);
+        await Process.start('cmd.exe', [
+          '/c',
+          'update.bat',
+        ], mode: ProcessStartMode.detached);
+        exit(0);
+      } else {
+        final contentDir = await _getHtmlPath();
+        final dir = Directory(tempDir);
+        for (final entity in dir.listSync(recursive: true)) {
+          final newPath = p.join(
+            contentDir,
+            p.relative(entity.path, from: tempDir),
+          );
+          if (entity is File && p.basename(entity.path) != p.basename(url)) {
+            File(newPath)
+              ..createSync(recursive: true)
+              ..writeAsBytesSync(entity.readAsBytesSync());
+          }
+        }
+        await File(
+          p.join(await _getDataPath(), 'content_version.txt'),
+        ).writeAsString(newVersion);
+        if (mounted) {
+          setState(() {
+            localContentVersion = newVersion;
+            isUpdateAvailable = false;
+            cachedUpdateData = null;
+            isUpdating = false;
+          });
+          _showMessage("อัปเดตข้อมูลสำเร็จ!");
+          final uri = await _getWebUri();
+          webViewController?.loadUrl(urlRequest: URLRequest(url: uri));
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        _showMessage("เกิดข้อผิดพลาด: $e");
+        setState(() => isUpdating = false);
+      }
+    }
+  }
+
+  // --- UI Builders ---
+  void _showMessage(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg, style: GoogleFonts.anuphan(color: Colors.white)),
+        backgroundColor: Colors.grey[900],
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
+  }
+
+  void _showModernDialog({required Widget child}) {
+    showGeneralDialog(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: "",
+      barrierColor: Colors.black54,
+      transitionDuration: const Duration(milliseconds: 250),
+      pageBuilder: (ctx, a1, a2) => Container(),
+      transitionBuilder: (ctx, a1, a2, w) => ScaleTransition(
+        scale: CurvedAnimation(parent: a1, curve: Curves.easeOut),
+        child: FadeTransition(
+          opacity: a1,
+          child: Dialog(
+            backgroundColor: Colors.white,
+            surfaceTintColor: Colors.transparent,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(28),
+            ),
+            child: child,
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showAboutDialog() {
+    _showModernDialog(child: _buildAboutContent());
+  }
+
+  void _showNoUpdateDialog() {
+    _showModernDialog(
+      child: SizedBox(
+        width: 340,
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.check_circle_rounded,
+                size: 64,
+                color: AppColors.accentColor,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                "ยังไม่มีอัปเดตใหม่",
+                style: GoogleFonts.anuphan(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: AppColors.primaryColor,
+                  ),
+                  onPressed: () => Navigator.pop(context),
+                  child: Text("ตกลง", style: GoogleFonts.anuphan()),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _infoRow(
+    String label,
+    String value, {
+    bool hasUpdate = false,
+    VoidCallback? onUpdate,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: GoogleFonts.anuphan(color: Colors.grey[600])),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                value,
+                style: GoogleFonts.anuphan(
+                  fontWeight: FontWeight.bold,
+                  color: hasUpdate ? Colors.grey[400] : AppColors.primaryColor,
+                ),
+              ),
+              if (hasUpdate) ...[
+                const SizedBox(width: 8),
+                SizedBox(
+                  height: 28,
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.secondaryColor.withValues(
+                        alpha: 0.1,
+                      ),
+                      foregroundColor: AppColors.secondaryColor,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      elevation: 0,
+                    ),
+                    onPressed: onUpdate,
+                    icon: const Icon(Icons.download_rounded, size: 14),
+                    label: Text(
+                      "อัปเดต",
+                      style: GoogleFonts.anuphan(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAboutContent() {
+    return SizedBox(
+      width: 340,
+      child: Padding(
+        padding: const EdgeInsetsGeometry.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsetsGeometry.all(5),
+              child: const Icon(
+                Icons.info_rounded,
+                size: 48,
+                color: AppColors.secondaryColor,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              "TCG FlipBook Reader",
+              style: GoogleFonts.anuphan(
+                fontWeight: FontWeight.bold,
+                color: AppColors.primaryColor,
+                fontSize: 16,
+              ),
+            ),
+            const SizedBox(height: 10),
+            _infoRow(
+              "เวอร์ชันโปรแกรม",
+              localAppVersion,
+              hasUpdate: _hasAppUp,
+              onUpdate: () {
+                Navigator.pop(context);
+                if (cachedUpdateData != null) {
+                  _showModernDialog(
+                    child: _buildUpdateDialogContent(
+                      cachedUpdateData!,
+                      _hasAppUp,
+                      _hasContUp,
+                    ),
+                  );
+                }
+              },
+            ),
+            const SizedBox(height: 1),
+            _infoRow(
+              "เวอร์ชันข้อมูล",
+              localContentVersion,
+              hasUpdate: _hasContUp,
+              onUpdate: () {
+                Navigator.pop(context);
+                if (cachedUpdateData != null) {
+                  _showModernDialog(
+                    child: _buildUpdateDialogContent(
+                      cachedUpdateData!,
+                      _hasAppUp,
+                      _hasContUp,
+                    ),
+                  );
+                }
+              },
+            ),
+            const SizedBox(height: 10),
+            Text(
+              "Licensed to : Corporate Name for corporate use only\n© 2026 Konnext Group, All Rights Reserved",
+              style: GoogleFonts.anuphan(fontSize: 11, color: Colors.grey),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.primaryColor,
+                  foregroundColor: const Color.fromARGB(255, 255, 255, 255),
+                ),
+                onPressed: () => Navigator.pop(context),
+                child: Text(
+                  "ปิด",
+                  style: GoogleFonts.anuphan(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUpdateDialogContent(
+    Map<String, dynamic> data,
+    bool appUp,
+    bool contUp,
+  ) {
+    return DefaultTabController(
+      length: 2,
+      initialIndex: appUp ? 0 : 1,
+      child: SizedBox(
+        width: 400,
+        height: 400,
+        child: Column(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(24),
+              decoration: const BoxDecoration(
+                color: AppColors.primaryColor,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+              ),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.system_update_rounded,
+                        color: Colors.white,
+                      ),
+                      const SizedBox(width: 12),
+                      Text(
+                        "มีอัปเดตใหม่",
+                        style: GoogleFonts.anuphan(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 18,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: TabBar(
+                      indicator: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      indicatorSize: TabBarIndicatorSize.tab,
+                      labelColor: AppColors.primaryColor,
+                      unselectedLabelColor: Colors.white70,
+                      dividerColor: Colors.transparent,
+                      tabs: [
+                        Tab(
+                          child: Text(
+                            "โปรแกรม",
+                            style: GoogleFonts.anuphan(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        Tab(
+                          child: Text(
+                            "ข้อมูล",
+                            style: GoogleFonts.anuphan(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: TabBarView(
+                children: [
+                  _buildUpdateTab(
+                    localAppVersion,
+                    data['app_version'],
+                    data['app_download_url'],
+                    data['app_changelog'],
+                    appUp,
+                    true,
+                  ),
+                  _buildUpdateTab(
+                    localContentVersion,
+                    data['content_version'],
+                    data['content_download_url'],
+                    data['content_changelog'],
+                    contUp,
+                    false,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUpdateTab(
+    String cur,
+    String next,
+    String url,
+    String? log,
+    bool hasUp,
+    bool isApp,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              _verChip(cur, Colors.grey),
+              const Icon(Icons.arrow_right_alt_rounded, color: Colors.grey),
+              _verChip(next, hasUp ? AppColors.secondaryColor : Colors.grey),
+            ],
+          ),
+          const SizedBox(height: 20),
+          Expanded(
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: AppColors.surfaceColor,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: SingleChildScrollView(
+                child: Text(
+                  hasUp ? (log ?? "ไม่มีรายละเอียด") : "เป็นเวอร์ชันล่าสุดแล้ว",
+                  style: GoogleFonts.anuphan(
+                    fontSize: 14,
+                    color: Colors.grey[800],
+                    height: 1.5,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          if (hasUp)
+            Row(
+              children: [
+                Expanded(
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: Text(
+                      "ไว้ทีหลัง",
+                      style: GoogleFonts.anuphan(color: Colors.grey),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(flex: 2, child: _buildDownloadBtn(url, next, isApp)),
+              ],
+            )
+          else
+            Center(
+              child: TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: Text(
+                  "ปิด",
+                  style: GoogleFonts.anuphan(color: Colors.grey),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _verChip(String t, Color c) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+    decoration: BoxDecoration(
+      color: c.withValues(alpha: 0.1),
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(color: c.withValues(alpha: 0.5)),
+    ),
+    child: Text(
+      t,
+      style: GoogleFonts.anuphan(
+        color: c,
+        fontWeight: FontWeight.bold,
+        fontSize: 12,
+      ),
+    ),
+  );
+
+  Widget _buildDownloadBtn(String url, String next, bool isApp) {
+    return FutureBuilder<bool>(
+      future: _checkFileExists(url),
+      builder: (c, s) {
+        bool ready = s.data ?? false;
+        bool loading = s.connectionState == ConnectionState.waiting;
+        return FilledButton.icon(
+          style: FilledButton.styleFrom(
+            backgroundColor: ready ? AppColors.primaryColor : Colors.grey[400],
+            padding: const EdgeInsets.symmetric(vertical: 12),
+          ),
+          onPressed: (ready && !isUpdating)
+              ? () {
+                  Navigator.pop(context);
+                  _updateProcess(url, next, isApp);
+                }
+              : null,
+          icon: loading
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                    color: Colors.white,
+                    strokeWidth: 2,
+                  ),
+                )
+              : const Icon(Icons.download_rounded, size: 18),
+          label: Text(
+            loading ? "ตรวจสอบ..." : (ready ? "อัปเดตเลย" : "ไม่พบไฟล์"),
+            style: GoogleFonts.anuphan(fontWeight: FontWeight.bold),
+          ),
+        );
+      },
+    );
+  }
+
+  // --- Main Build ---
+
+  // >>>>>> ส่วนที่แก้ไข: Auto Close Timer <<<<<<
+  void _toggleMenu() {
+    setState(() {
+      isMenuOpen = !isMenuOpen;
+      if (isMenuOpen) {
+        _menuController.forward();
+        _startMenuTimer(); // เริ่มนับถอยหลังเมื่อเปิด
+      } else {
+        _menuController.reverse();
+        _cancelMenuTimer(); // ยกเลิกเมื่อปิด
+      }
+    });
+  }
+
+  void _startMenuTimer() {
+    _cancelMenuTimer(); // เคลียร์ของเก่าก่อนเสมอ
+    _menuAutoCloseTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted && isMenuOpen) {
+        setState(() {
+          isMenuOpen = false;
+          _menuController.reverse();
+        });
+      }
+    });
+  }
+
+  void _cancelMenuTimer() {
+    _menuAutoCloseTimer?.cancel();
+    _menuAutoCloseTimer = null;
+  }
+  // >>>>>> -------------------------------- <<<<<<
+
+  Widget _buildMenu() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        _animItem(
+          3,
+          FloatingActionButton.small(
+            heroTag: 'about',
+            backgroundColor: Colors.white,
+            tooltip: "เกี่ยวกับแอปพลิเคชัน",
+            onPressed: () => _showAboutDialog(),
+            child: const Icon(
+              Icons.info_outline_rounded,
+              color: Colors.black87,
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _animItem(
+          2,
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              FloatingActionButton.small(
+                heroTag: 'sync',
+                backgroundColor: Colors.white,
+                tooltip: "ตรวจสอบการอัปเดต",
+                onPressed: () {
+                  _checkUpdateAutomatically(isManual: true);
+                  _toggleMenu();
+                },
+                child: Icon(
+                  Icons.cloud_sync_rounded,
+                  color: isUpdateAvailable
+                      ? AppColors.primaryColor
+                      : Colors.black87,
+                ),
+              ),
+              if (isUpdateAvailable)
+                Positioned(
+                  top: -2,
+                  right: -2,
+                  child: Container(
+                    width: 12,
+                    height: 12,
+                    decoration: BoxDecoration(
+                      color: AppColors.notiColor,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 2),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        _animItem(
+          1,
+          FloatingActionButton.small(
+            heroTag: 'home',
+            backgroundColor: Colors.white,
+            tooltip: "กลับไปหน้าเลือกภาษา",
+            onPressed: () async {
+              final uri = await _getWebUri();
+              webViewController?.loadUrl(urlRequest: URLRequest(url: uri));
+              _toggleMenu();
+            },
+            child: const Icon(Icons.home_outlined, color: Colors.black87),
+          ),
+        ),
+        const SizedBox(height: 12),
+        FloatingActionButton(
+          heroTag: 'menu',
+          backgroundColor: AppColors.primaryColor,
+          shape: const CircleBorder(),
+          onPressed: _toggleMenu,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              RotationTransition(
+                turns: Tween(begin: 0.0, end: 0.0).animate(
+                  CurvedAnimation(
+                    parent: _menuController,
+                    curve: Curves.elasticOut,
+                  ),
+                ),
+                child: Icon(
+                  isMenuOpen ? Icons.menu_open : Icons.menu_rounded,
+                  size: 28,
+                  color: Colors.white,
+                ),
+              ),
+              if (isUpdateAvailable && !isMenuOpen)
+                Positioned(
+                  top: -2,
+                  right: -2,
+                  child: Container(
+                    width: 14,
+                    height: 14,
+                    decoration: BoxDecoration(
+                      color: AppColors.notiColor,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: AppColors.primaryColor,
+                        width: 2,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _animItem(int idx, Widget child) {
+    final start = (3 - idx) * 0.1;
+    final fade = Tween(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _menuController,
+        curve: Interval(start, start + 0.5, curve: Curves.easeOut),
+      ),
+    );
+    final slide = Tween(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+      CurvedAnimation(
+        parent: _menuController,
+        curve: Interval(start, start + 0.5, curve: Curves.easeOutCubic),
+      ),
+    );
+    return ScaleTransition(
+      scale: fade,
+      child: SlideTransition(
+        position: slide,
+        child: FadeTransition(opacity: fade, child: child),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 800),
+            child: (!fileExists && !isUpdating)
+                ? Center(
+                    child: Text(
+                      "ไม่พบเนื้อหาหรือไฟล์ข้อมูลมีปัญหา\nกรุณาติดต่อผู้ประสานงานเพื่อรับการแก้ไข",
+                      style: GoogleFonts.anuphan(color: Colors.white),
+                      textAlign: TextAlign.center,
+                    ),
+                  )
+                : Stack(
+                    children: [
+                      // --- ปรับปรุงจุดที่ 2: ใช้ FutureBuilder ห่อ WebView ---
+                      FutureBuilder<WebUri>(
+                        future: _getWebUri(),
+                        builder: (context, snapshot) {
+                          if (!snapshot.hasData) {
+                            return Container(color: Colors.black);
+                          }
+                          return InAppWebView(
+                            initialUrlRequest: URLRequest(url: snapshot.data),
+                            initialSettings: InAppWebViewSettings(
+                              allowFileAccessFromFileURLs: true,
+                              allowUniversalAccessFromFileURLs: true,
+                              transparentBackground: true,
+                              useOnDownloadStart: true,
+                            ),
+
+                            onWebViewCreated: (c) => webViewController = c,
+                            shouldOverrideUrlLoading:
+                                (controller, navigationAction) async {
+                                  final uri = navigationAction.request.url;
+                                  if (uri != null &&
+                                      uri.path.toLowerCase().endsWith('.pdf')) {
+                                    await InAppBrowser.openWithSystemBrowser(
+                                      url: uri,
+                                    );
+                                    return NavigationActionPolicy.CANCEL;
+                                  }
+                                  return NavigationActionPolicy.ALLOW;
+                                },
+                            onProgressChanged: (c, p) {
+                              if (mounted) setState(() => webProgress = p);
+                              if (p == 100) {
+                                if (isPageLoading) {
+                                  setState(() => isPageLoading = false);
+                                }
+                                if (!hasCheckedUpdate) {
+                                  // ของเดิม: ใช้ Future.delayed (คุมไม่ได้)
+                                  // Future.delayed(const Duration(seconds: 2), ... );
+
+                                  // ✅ ของใหม่: ใช้ Timer (สั่งหยุดได้)
+                                  _autoUpdateTimer
+                                      ?.cancel(); // เคลียร์ของเก่าถ้ามี
+                                  _autoUpdateTimer = Timer(
+                                    const Duration(seconds: 2),
+                                    () {
+                                      if (mounted) {
+                                        _checkUpdateAutomatically(
+                                          isManual: false,
+                                        );
+                                      }
+                                    },
+                                  );
+                                }
+                              }
+                            },
+                          );
+                        },
+                      ),
+                      IgnorePointer(
+                        ignoring: !isPageLoading,
+                        child: AnimatedOpacity(
+                          opacity: isPageLoading ? 1.0 : 0.0,
+                          duration: const Duration(milliseconds: 500),
+                          curve: Curves.easeInOut,
+                          child: Container(
+                            color: Colors.black,
+                            child: Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  RotationTransition(
+                                    turns: _loadingController,
+                                    child: const Icon(
+                                      Icons.donut_large,
+                                      size: 40,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+
+                                  const SizedBox(height: 24),
+                                  Text(
+                                    "กำลังเปิดแอปพลิเคชัน...",
+                                    style: GoogleFonts.anuphan(
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 24),
+                                  SizedBox(
+                                    width: 200,
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(10),
+                                      child: LinearProgressIndicator(
+                                        value: webProgress / 100.0,
+                                        backgroundColor: Colors.white10,
+                                        valueColor:
+                                            const AlwaysStoppedAnimation(
+                                              AppColors.secondaryColor,
+                                            ),
+                                        minHeight: 4,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+          if (isUpdating)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                color: Colors.black87,
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: LinearProgressIndicator(
+                          value: downloadProgress,
+                          minHeight: 6,
+                          backgroundColor: Colors.grey[800],
+                          valueColor: const AlwaysStoppedAnimation(
+                            AppColors.secondaryColor,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      "${(downloadProgress * 100).toStringAsFixed(0)}%",
+                      style: GoogleFonts.anuphan(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          if (!isUpdating)
+            Positioned(bottom: 30, right: 30, child: _buildMenu()),
+        ],
+      ),
+    );
+  }
+}
