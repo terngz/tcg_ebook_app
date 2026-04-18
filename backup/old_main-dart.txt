@@ -148,52 +148,30 @@ class _PortableAppState extends State<PortableApp>
   }
 
   Future<void> _restoreUpdateState() async {
-    final cacheFile = await _getUpdateCacheFile();
-    if (await cacheFile.exists()) {
-      try {
-        final content = await cacheFile.readAsString();
-        final decoded = jsonDecode(content);
+    try {
+      final file = await _getUpdateCacheFile();
+      if (await file.exists()) {
+        final data = jsonDecode(await file.readAsString());
+        bool appUp =
+            (data['app_version'] ?? localAppVersion) != localAppVersion;
+        bool contUp =
+            (data['content_version'] ?? localContentVersion) !=
+            localContentVersion;
 
-        // อ่านข้อมูลจากก้อน 'data' ตามโครงสร้างใหม่ที่เราเพิ่งแก้
-        final serverData = decoded['data'];
-
-        if (serverData != null) {
-          // ในฟังก์ชัน _restoreUpdateState
-          bool appUp = _isNewerVersion(
-            serverData['app_version'] ?? localAppVersion,
-            localAppVersion,
-          );
-          bool contUp = _isNewerVersion(
-            serverData['content_version'] ?? localContentVersion,
-            localContentVersion,
-          );
-
-          if (appUp || contUp) {
+        if (appUp || contUp) {
+          if (mounted) {
             setState(() {
               isUpdateAvailable = true;
-              cachedUpdateData = serverData;
+              cachedUpdateData = data;
               _hasAppUp = appUp;
               _hasContUp = contUp;
             });
           }
+        } else {
+          await file.delete();
         }
-      } catch (_) {}
-    }
-  }
-
-  // ฟังก์ชันสำหรับเช็คว่าเวอร์ชันใหม่ (v1) สูงกว่าเวอร์ชันปัจจุบัน (v2) หรือไม่
-  bool _isNewerVersion(String v1, String v2) {
-    try {
-      List<int> v1Nums = v1.split('.').map(int.parse).toList();
-      List<int> v2Nums = v2.split('.').map(int.parse).toList();
-
-      for (int i = 0; i < v1Nums.length; i++) {
-        if (i >= v2Nums.length) return true;
-        if (v1Nums[i] > v2Nums[i]) return true;
-        if (v1Nums[i] < v2Nums[i]) return false;
       }
     } catch (_) {}
-    return false;
   }
 
   Future<void> _loadLocalVersions() async {
@@ -232,37 +210,10 @@ class _PortableAppState extends State<PortableApp>
     }
   }
 
-  // --- Update Logic (ปรับปรุงใหม่: เช็คแค่วันละครั้งเพื่อลดภาระ Server) ---
+  // --- Update Logic ---
   Future<void> _checkUpdateAutomatically({bool isManual = false}) async {
     try {
-      final cacheFile = await _getUpdateCacheFile();
-
-      // 1. ตรวจสอบเงื่อนไข "เวลา" (ยกเว้นกดเช็คเอง)
-      if (!isManual) {
-        if (await cacheFile.exists()) {
-          final content = await cacheFile.readAsString();
-          final cacheJson = jsonDecode(content);
-
-          // ตรวจสอบว่าเคยบันทึกเวลาไว้ไหม
-          if (cacheJson['last_checked'] != null) {
-            final lastCheck = DateTime.tryParse(cacheJson['last_checked']);
-            if (lastCheck != null) {
-              final diff = DateTime.now().difference(lastCheck);
-              // ถ้าเช็คไปเมื่อไม่เกิน 24 ชั่วโมง ให้ข้ามการต่อ Server ไปเลย
-              if (diff.inHours < 24) {
-                debugPrint(
-                  "Skip: เพิ่งเช็คไปเมื่อ ${diff.inHours} ชม. ที่แล้ว",
-                );
-                return;
-              }
-            }
-          }
-        }
-
-        if (isUpdateAvailable) return;
-      }
-
-      // 2. ถ้าเข้าเงื่อนไข (หรือกด Manual) ให้แสดงข้อความและยิง Request
+      if (!isManual && isUpdateAvailable) return;
       if (isManual && isUpdateAvailable && cachedUpdateData != null) {
         _showModernDialog(
           child: _buildUpdateDialogContent(
@@ -278,7 +229,7 @@ class _PortableAppState extends State<PortableApp>
       final response = await http
           .get(
             Uri.parse(
-              'http://www.konnextgroup.com/testweb/appupdates/tcg/tcgar2025/ar2025version.json',
+              'http://www.konnextgroup.com/testweb/appupdates/version.json',
             ),
             headers: kBrowserHeaders,
           )
@@ -289,40 +240,26 @@ class _PortableAppState extends State<PortableApp>
           if (isManual && mounted) _showMessage("Server Busy (Bot Protection)");
           return;
         }
-
-        final serverData = jsonDecode(utf8.decode(response.bodyBytes));
-
-        // --- ส่วนสำคัญ: เตรียมข้อมูลที่จะเซฟลง Cache (รวมเวลาล่าสุด) ---
-        final dataToCache = {
-          'last_checked': DateTime.now()
-              .toIso8601String(), // บันทึกเวลาที่คุยกับ server
-          'data': serverData, // ข้อมูลเวอร์ชันจาก server
-        };
-        await cacheFile.writeAsString(jsonEncode(dataToCache));
-        // -------------------------------------------------------
-
-        // เช็คเฉพาะถ้าเลขเวอร์ชันจาก Server "สูงกว่า" ในเครื่องเท่านั้น
-        bool appUp = _isNewerVersion(
-          serverData['app_version'] ?? localAppVersion,
-          localAppVersion,
-        );
-
-        bool contUp = _isNewerVersion(
-          serverData['content_version'] ?? localContentVersion,
-          localContentVersion,
-        );
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
+        bool appUp =
+            (data['app_version'] ?? localAppVersion) != localAppVersion;
+        bool contUp =
+            (data['content_version'] ?? localContentVersion) !=
+            localContentVersion;
 
         if (appUp || contUp) {
           if (mounted) {
             setState(() {
               isUpdateAvailable = true;
-              cachedUpdateData = serverData;
+              cachedUpdateData = data;
               _hasAppUp = appUp;
               _hasContUp = contUp;
             });
+            final cacheFile = await _getUpdateCacheFile();
+            cacheFile.writeAsString(jsonEncode(data));
             if (isManual) {
               _showModernDialog(
-                child: _buildUpdateDialogContent(serverData, appUp, contUp),
+                child: _buildUpdateDialogContent(data, appUp, contUp),
               );
             }
           }
@@ -332,6 +269,10 @@ class _PortableAppState extends State<PortableApp>
               isUpdateAvailable = false;
               cachedUpdateData = null;
             });
+            final cacheFile = await _getUpdateCacheFile();
+            if (await cacheFile.exists()) {
+              await cacheFile.delete();
+            }
             if (isManual) _showNoUpdateDialog();
           }
         }
@@ -339,7 +280,7 @@ class _PortableAppState extends State<PortableApp>
         _showMessage("เชื่อมต่อไม่ได้ (Code: ${response.statusCode})");
       }
       if (!isManual) hasCheckedUpdate = true;
-    } catch (e) {
+    } catch (_) {
       if (isManual && mounted) _showMessage("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้");
     }
   }
@@ -360,80 +301,43 @@ class _PortableAppState extends State<PortableApp>
     String newVersion,
     bool isAppUpdate,
   ) async {
-    // 1. ตั้งค่าสถานะเริ่มต้น
     setState(() {
       isUpdating = true;
       downloadProgress = 0.0;
     });
-
-    // 2. หยุดการทำงานของ WebView และล้างหน้าจอ (ป้องกัน File Not Found)
-    try {
-      await webViewController?.stopLoading();
-      await webViewController?.loadUrl(
-        urlRequest: URLRequest(url: WebUri("about:blank")),
-      );
-    } catch (e) {
-      debugPrint("WebView cleanup ignored: $e");
-    }
-
-    // 3. ให้เวลาระบบ Render UI "กำลังอัปเดต" สักครู่ก่อนเริ่มโหลดไฟล์
-    await Future.delayed(const Duration(milliseconds: 500));
-
     final tempDir = _getTempPath();
     final zipPath = p.join(tempDir, p.basename(url));
 
     try {
-      // ล้างไฟล์เก่าใน Temp
       if (Directory(tempDir).existsSync()) {
         Directory(tempDir).deleteSync(recursive: true);
       }
       Directory(tempDir).createSync(recursive: true);
 
-      // --- เริ่มการดาวน์โหลด ---
       final client = http.Client();
       final request = http.Request('GET', Uri.parse(url))
         ..headers.addAll(kBrowserHeaders);
-      final response = await client
-          .send(request)
-          .timeout(const Duration(seconds: 15));
+      final response = await client.send(request);
 
-      if (response.statusCode != 200)
-        throw Exception("Server returned ${response.statusCode}");
-
+      if (response.statusCode != 200) throw Exception("Download Failed");
       final total = response.contentLength ?? 1;
       int received = 0;
-      final bytes =
-          <
-            int
-          >[]; // ใช้ List เก็บ bytes แทนการเปิด Sink ทันทีเพื่อความเร็วบน USB
+      final sink = File(zipPath).openWrite();
 
-      final completer = Completer<void>();
-      response.stream.listen(
-        (chunk) {
-          bytes.addAll(chunk);
-          received += chunk.length;
-          if (mounted) {
-            setState(() {
-              // ช่วงแรก 0.0 - 0.7 คือการดาวน์โหลด
-              downloadProgress = (received / total) * 0.7;
-            });
-          }
-        },
-        onDone: () => completer.complete(),
-        onError: (e) => completer.completeError(e),
-        cancelOnError: true,
-      );
-
-      await completer.future;
+      await response.stream.forEach((chunk) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (mounted) {
+          setState(() => downloadProgress = (received / total) * 0.5);
+        }
+      });
+      await sink.flush();
+      await sink.close();
       client.close();
 
-      // เขียนไฟล์ลง Temp
-      await File(zipPath).writeAsBytes(bytes);
-
-      // --- เริ่มการแตกไฟล์ ---
-      if (mounted) setState(() => downloadProgress = 0.75);
-
-      final archive = ZipDecoder().decodeBytes(File(zipPath).readAsBytesSync());
+      final bytes = await File(zipPath).readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
+      int count = 0;
       for (final file in archive) {
         final fPath = p.join(tempDir, file.name);
         if (file.isFile) {
@@ -443,62 +347,68 @@ class _PortableAppState extends State<PortableApp>
         } else {
           Directory(fPath).createSync(recursive: true);
         }
+        count++;
+        if (mounted) {
+          setState(
+            () => downloadProgress = 0.5 + ((count / archive.length) * 0.5),
+          );
+        }
       }
 
-      if (mounted) setState(() => downloadProgress = 1.0);
+      final cacheFile = await _getUpdateCacheFile();
+      if (await cacheFile.exists()) await cacheFile.delete();
 
-      // บันทึกเวอร์ชันเนื้อหา (ถ้าเป็นการอัปเดตเนื้อหา)
-      if (!isAppUpdate) {
-        final dataDir = await _getDataPath();
-        await File(
-          p.join(dataDir, 'content_version.txt'),
-        ).writeAsString(newVersion);
-      }
-
-      // --- รัน Batch เพื่อ Restart (ใช้ Logic เดิมที่ถูกต้อง) ---
-      if (Platform.isWindows) {
-        final exePath = Platform.resolvedExecutable;
-        final exeName = p.basename(exePath);
-        final exeDir = p.dirname(exePath);
-
+      if (isAppUpdate && Platform.isWindows) {
         final bat =
             '''
 @echo off
-setlocal
-title System Update
-mode con: cols=60 lines=10
-color 0B
-echo ============================================
-echo      UPDATE IN PROGRESS, PLEASE WAIT...
-echo ============================================
-echo.
-echo [1/3] Closing application...
-timeout /t 3 /nobreak >nul
-taskkill /F /IM "$exeName" /T >nul 2>&1
-
-echo [2/3] Applying updates to $exeDir...
-echo --------------------------------------------
-robocopy "$tempDir" "$exeDir " /E /R:1 /W:1 /MT:8 /XF *.zip /V
-echo --------------------------------------------
-
-echo [3/3] Restarting system...
-timeout /t 2 /nobreak >nul
-start "" "$exePath"
+timeout /t 3 >nul
+taskkill /F /IM "${p.basename(Platform.resolvedExecutable)}" /T
+robocopy "$tempDir" "${p.dirname(Platform.resolvedExecutable)}" /E /R:3 /W:1 /XF *.zip
+start "" "${Platform.resolvedExecutable}"
 del "%~f0" & exit
 ''';
-
-        final batFile = File(p.join(exeDir, 'update.bat'));
-        await batFile.writeAsString(bat);
+        await File(
+          p.join(p.dirname(Platform.resolvedExecutable), 'update.bat'),
+        ).writeAsString(bat);
         await Process.start('cmd.exe', [
           '/c',
           'update.bat',
         ], mode: ProcessStartMode.detached);
         exit(0);
+      } else {
+        final contentDir = await _getHtmlPath();
+        final dir = Directory(tempDir);
+        for (final entity in dir.listSync(recursive: true)) {
+          final newPath = p.join(
+            contentDir,
+            p.relative(entity.path, from: tempDir),
+          );
+          if (entity is File && p.basename(entity.path) != p.basename(url)) {
+            File(newPath)
+              ..createSync(recursive: true)
+              ..writeAsBytesSync(entity.readAsBytesSync());
+          }
+        }
+        await File(
+          p.join(await _getDataPath(), 'content_version.txt'),
+        ).writeAsString(newVersion);
+        if (mounted) {
+          setState(() {
+            localContentVersion = newVersion;
+            isUpdateAvailable = false;
+            cachedUpdateData = null;
+            isUpdating = false;
+          });
+          _showMessage("อัปเดตข้อมูลสำเร็จ!");
+          final uri = await _getWebUri();
+          webViewController?.loadUrl(urlRequest: URLRequest(url: uri));
+        }
       }
     } catch (e) {
       if (mounted) {
+        _showMessage("เกิดข้อผิดพลาด: $e");
         setState(() => isUpdating = false);
-        _showMessage("ไม่สามารถดาวน์โหลดได้: $e");
       }
     }
   }
@@ -1143,7 +1053,7 @@ del "%~f0" & exit
             child: (!fileExists && !isUpdating)
                 ? Center(
                     child: Text(
-                      "ไม่พบเนื้อหาหรือไฟล์ข้อมูลมีปัญหา\nกรุณาอัปเดตเนื้อหาแล้วเปิดแอปพลิเคชันใหม่อีกครั้ง\nหากยังพบปัญหากรุณาติดต่อผู้ประสานงานของคุณ",
+                      "ไม่พบเนื้อหาหรือไฟล์ข้อมูลมีปัญหา\nกรุณาติดต่อผู้ประสานงานเพื่อรับการแก้ไข",
                       style: GoogleFonts.anuphan(color: Colors.white),
                       textAlign: TextAlign.center,
                     ),
@@ -1193,7 +1103,7 @@ del "%~f0" & exit
                                   _autoUpdateTimer
                                       ?.cancel(); // เคลียร์ของเก่าถ้ามี
                                   _autoUpdateTimer = Timer(
-                                    const Duration(seconds: 60),
+                                    const Duration(seconds: 2),
                                     () {
                                       if (mounted) {
                                         _checkUpdateAutomatically(
@@ -1261,80 +1171,42 @@ del "%~f0" & exit
                     ],
                   ),
           ),
-          // ภายใน Stack ในฟังก์ชัน build
-          Stack(
-            children: [
-              // WebView และส่วนอื่นๆ ...
-              if (isUpdating)
-                Container(
-                  key: const ValueKey(
-                    'UpdateOverlay',
-                  ), // เพิ่ม Key เพื่อให้ Flutter มั่นใจว่าต้องวาดใหม่
-                  color: Colors.black,
-                  width: double.infinity,
-                  height: double.infinity,
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.system_update_alt_rounded,
-                          size: 50,
-                          color: AppColors.secondaryColor,
-                        ),
-                        const SizedBox(height: 32),
-                        Text(
-                          "กำลังดาวน์โหลดอัปเดตใหม่... กรุณารอสักครู่",
-                          textAlign: TextAlign.center, // เพิ่มบรรทัดนี้
-                          style: GoogleFonts.anuphan(
-                            color: Colors.white,
-                            fontSize: 20,
-                            fontWeight: FontWeight.bold,
+          if (isUpdating)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                color: Colors.black87,
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: LinearProgressIndicator(
+                          value: downloadProgress,
+                          minHeight: 6,
+                          backgroundColor: Colors.grey[800],
+                          valueColor: const AlwaysStoppedAnimation(
+                            AppColors.secondaryColor,
                           ),
                         ),
-                        const SizedBox(height: 12),
-                        Text(
-                          "อย่าปิดแอปพลิเคชั่นจนกว่าการดาวน์โหลดจะเสร็จสมบูรณ์\nโปรแกรมจะรีสตาร์ทอัตโนมัติเมื่อพร้อมใช้งาน\nหากโปรแกรมไม่เปิดใหม่ กรุณาเปิดแอปพลิเคชันใหม่ด้วยตนเอง",
-                          textAlign: TextAlign.center, // เพิ่มบรรทัดนี้
-                          style: GoogleFonts.anuphan(
-                            color: Colors.white70,
-                            fontSize: 14,
-                          ),
-                        ),
-                        const SizedBox(height: 48),
-                        SizedBox(
-                          width: 320,
-                          child: Column(
-                            children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(12),
-                                child: LinearProgressIndicator(
-                                  value: downloadProgress,
-                                  minHeight: 15,
-                                  backgroundColor: Colors.white10,
-                                  valueColor: const AlwaysStoppedAnimation(
-                                    AppColors.secondaryColor,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-                              Text(
-                                "${(downloadProgress * 100).toStringAsFixed(0)}%",
-                                style: GoogleFonts.anuphan(
-                                  color: Colors.white,
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
-                  ),
+                    const SizedBox(width: 8),
+                    Text(
+                      "${(downloadProgress * 100).toStringAsFixed(0)}%",
+                      style: GoogleFonts.anuphan(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
                 ),
-            ],
-          ),
+              ),
+            ),
 
           if (!isUpdating)
             Positioned(bottom: 30, right: 30, child: _buildMenu()),
