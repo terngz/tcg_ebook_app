@@ -1,8 +1,8 @@
 {
-  "app_version": "1.0.0",
-  "app_download_url": "http://www.konnextgroup.com/testweb/appupdates/tcg/tcgar2025/tcgar_update_100.zip",
-  "app_changelog": "๊Initial release of the app with basic features and content.",
-  "content_version": "1.0.0",
-  "content_download_url": "http://www.konnextgroup.com/testweb/appupdates/tcg/tcgar2025/tcgar_contents_100.zip",
-  "content_changelog": "Initial release of the content."
+  "app_version": "1.0.1",
+  "app_download_url": "http://www.konnextgroup.com/testweb/appupdates/tcg/tcgar2025/tcgar_update_101.zip",
+  "app_changelog": "ปรับปรุงระบบการอัพเดทแอพพลิเคชั่นให้มีประสิทธิภาพมากขึ้น",
+  "content_version": "1.0.1",
+  "content_download_url": "http://www.konnextgroup.com/testweb/appupdates/tcg/tcgar2025/tcgar_contents_101.zip",
+  "content_changelog": "ปรับปรุงเนื้อหาให้มีความสมบูรณ์และอัพเดทข้อมูลใหม่ๆ เพิ่มเติม"
 }

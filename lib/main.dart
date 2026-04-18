@@ -641,7 +641,7 @@ del "%~f0" & exit
 
   Widget _buildAboutContent() {
     return SizedBox(
-      width: 340,
+      width: 380,
       child: Padding(
         padding: const EdgeInsetsGeometry.all(20),
         child: Column(
@@ -702,7 +702,7 @@ del "%~f0" & exit
             ),
             const SizedBox(height: 10),
             Text(
-              "Licensed to : Corporate Name for corporate use only\n© 2026 Konnext Group, All Rights Reserved",
+              "This program is licensed for use solely by the organization that owns this content. Unauthorized access, reproduction, or modification is prohibited.\n© 2026, Developed by Konnext Group, All Rights Reserved",
               style: GoogleFonts.anuphan(fontSize: 11, color: Colors.grey),
               textAlign: TextAlign.center,
             ),
@@ -1143,7 +1143,7 @@ del "%~f0" & exit
             child: (!fileExists && !isUpdating)
                 ? Center(
                     child: Text(
-                      "ไม่พบเนื้อหาหรือไฟล์ข้อมูลมีปัญหา\nกรุณาอัปเดตเนื้อหาแล้วเปิดแอปพลิเคชันใหม่อีกครั้ง\nหากยังพบปัญหากรุณาติดต่อผู้ประสานงานของคุณ",
+                      "ไม่พบเนื้อหาหรือไฟล์ข้อมูลมีปัญหา\nกรุณาอัปเดตเนื้อหาแล้วเปิดแอปพลิเคชันใหม่อีกครั้ง\nหรือหากยังพบปัญหากรุณาติดต่อผู้ประสานงานของคุณ",
                       style: GoogleFonts.anuphan(color: Colors.white),
                       textAlign: TextAlign.center,
                     ),
